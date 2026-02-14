@@ -10,6 +10,8 @@ import {
   resolveTurn,
   useReserve,
   declareEscalation,
+  declareWarEscalation,
+  skipWarEscalation,
 } from '../turns';
 
 // Helper to create a card
@@ -608,5 +610,109 @@ describe('Squabble resolution', () => {
 
     // p1 should end up with the cards
     expect(resolved.log.some(l => l.includes("can't beat") || l.includes('takes all'))).toBe(true);
+  });
+});
+
+describe('War Escalation', () => {
+  it('detects war escalation eligibility when card is 1 below winner', () => {
+    // Set up a war where after flip, someone is 1 below
+    const state = createGameState([
+      createPlayer('p1', [card(3), card(4), card(5), card(13)], { flippedCard: card(10) }), // Will flip King
+      createPlayer('p2', [card(6), card(7), card(8), card(12)], { flippedCard: card(10) }), // Will flip Queen
+    ], {
+      warState: {
+        type: 'standard',
+        participants: ['p1', 'p2'],
+        sacrificeCount: { p1: 3, p2: 3 },
+        pot: [],
+        round: 1,
+        originalCards: { p1: card(10), p2: card(10) },
+        warFlipCards: {},
+      },
+      currentPhase: 'war_sacrifice',
+    });
+
+    const afterSacrifice = executeWarSacrifice(state);
+    const afterFlip = executeWarFlip(afterSacrifice);
+    const resolved = resolveWar(afterFlip);
+
+    // Should have pending escalation for p2 (Queen is 1 below King)
+    expect(resolved.pendingEscalation).toBe('p2');
+  });
+
+  it('war escalation continues the war with 4 vs 3 sacrifice', () => {
+    const state = createGameState([
+      createPlayer('p1', Array.from({ length: 10 }, () => card(5)), { flippedCard: card(13) }), // King
+      createPlayer('p2', Array.from({ length: 10 }, () => card(5)), { flippedCard: card(12) }), // Queen
+    ], {
+      warState: {
+        type: 'standard',
+        participants: ['p1', 'p2'],
+        sacrificeCount: { p1: 3, p2: 3 },
+        pot: [card(10), card(10)], // Original cards
+        round: 1,
+        originalCards: { p1: card(10), p2: card(10) },
+        warFlipCards: { p1: card(13), p2: card(12) },
+      },
+      pendingEscalation: 'p2',
+      currentPhase: 'war_resolve',
+    });
+
+    const afterEscalation = declareWarEscalation(state, 'p2');
+
+    expect(afterEscalation.warState?.sacrificeCount['p2']).toBe(4); // Escalating player
+    expect(afterEscalation.warState?.sacrificeCount['p1']).toBe(3); // Defender
+    expect(afterEscalation.warState?.round).toBe(2);
+    expect(afterEscalation.currentPhase).toBe('war_sacrifice');
+  });
+
+  it('skipping war escalation finalizes the winner', () => {
+    const state = createGameState([
+      createPlayer('p1', Array.from({ length: 10 }, () => card(5)), { flippedCard: card(13) }), // King
+      createPlayer('p2', Array.from({ length: 10 }, () => card(5)), { flippedCard: card(12) }), // Queen
+    ], {
+      warState: {
+        type: 'standard',
+        participants: ['p1', 'p2'],
+        sacrificeCount: { p1: 3, p2: 3 },
+        pot: [card(10), card(10)],
+        round: 1,
+        originalCards: { p1: card(10), p2: card(10) },
+        warFlipCards: { p1: card(13), p2: card(12) },
+      },
+      pendingEscalation: 'p2',
+      currentPhase: 'war_resolve',
+    });
+
+    const afterSkip = skipWarEscalation(state);
+
+    expect(afterSkip.warState).toBeNull(); // War resolved
+    expect(afterSkip.lastWarResult?.winnerId).toBe('p1'); // King wins
+  });
+
+  it('double war (tie) triggers another round', () => {
+    const state = createGameState([
+      createPlayer('p1', [card(3), card(4), card(5), card(10)], { flippedCard: card(7) }),
+      createPlayer('p2', [card(6), card(7), card(8), card(10)], { flippedCard: card(7) }),
+    ], {
+      warState: {
+        type: 'standard',
+        participants: ['p1', 'p2'],
+        sacrificeCount: { p1: 3, p2: 3 },
+        pot: [],
+        round: 1,
+        originalCards: { p1: card(7), p2: card(7) },
+        warFlipCards: {},
+      },
+      currentPhase: 'war_sacrifice',
+    });
+
+    const afterSacrifice = executeWarSacrifice(state);
+    const afterFlip = executeWarFlip(afterSacrifice);
+    const resolved = resolveWar(afterFlip);
+
+    // Both flipped 10 - should be double war
+    expect(resolved.warState?.round).toBe(2);
+    expect(resolved.log.some(l => l.includes('DOUBLE WAR'))).toBe(true);
   });
 });

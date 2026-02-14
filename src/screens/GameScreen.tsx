@@ -14,6 +14,8 @@ import {
   useReserve,
   declareEscalation,
   skipEscalation,
+  declareWarEscalation,
+  skipWarEscalation,
 } from '../engine/turns';
 import { shouldAIEscalate, shouldAIUseReserve } from '../engine/ai';
 import { PlayerZone } from '../components/PlayerZone';
@@ -28,6 +30,7 @@ type UIPhase =
   | 'showing_result'        // All cards shown, showing who won
   | 'reserve_decision'      // User can swap reserve
   | 'escalation_decision'   // User can escalate
+  | 'war_escalation_decision' // User can escalate during war
   | 'war_setup'             // War declared, showing sacrifice counts
   | 'waiting_for_war_flip'  // User needs to tap FLIP WAR CARDS
   | 'war_flipping'          // War cards being revealed one by one
@@ -54,6 +57,8 @@ type GameAction =
   | { type: 'USE_RESERVE'; playerId: string }
   | { type: 'ESCALATE'; playerId: string }
   | { type: 'SKIP_ESCALATE' }
+  | { type: 'WAR_ESCALATE'; playerId: string }
+  | { type: 'SKIP_WAR_ESCALATE' }
   | { type: 'PROCESS_OUTCOME' }
   | { type: 'INITIATE_WAR' }
   | { type: 'WAR_SACRIFICE' }
@@ -76,6 +81,12 @@ function gameReducer(state: GameState, action: GameAction): GameState {
 
     case 'SKIP_ESCALATE':
       return skipEscalation(state);
+
+    case 'WAR_ESCALATE':
+      return declareWarEscalation(state, action.playerId);
+
+    case 'SKIP_WAR_ESCALATE':
+      return skipWarEscalation(state);
 
     case 'PROCESS_OUTCOME': {
       const outcome = detectOutcome(state);
@@ -254,7 +265,7 @@ export function GameScreen() {
     }
   }, [uiState.phase, uiState.revealedWarPlayers.length, state.warState]);
 
-  // Transition to war_result when lastWarResult is populated
+  // Transition after war resolve - check for escalation or result
   useEffect(() => {
     if (uiState.phase === 'war_flipping' && state.lastWarResult && !state.warState) {
       // War was resolved and we have a result - use captured pot cards
@@ -271,16 +282,68 @@ export function GameScreen() {
           potCards: capturedPotRef.current,
         },
       });
+    } else if (uiState.phase === 'war_flipping' && state.warState && state.pendingEscalation) {
+      // Someone can escalate during war!
+      if (state.pendingEscalation === 'human') {
+        // Human can escalate
+        const humanCard = humanPlayer.flippedCard;
+        setUIState({
+          phase: 'war_escalation_decision',
+          revealedPlayers: [],
+          revealedWarPlayers: state.warState.participants,
+          message: humanCard ? `Your ${humanCard.display} is 1 below! ESCALATE?` : 'You can ESCALATE!',
+        });
+      } else {
+        // AI decides
+        if (shouldAIEscalate(state, state.pendingEscalation)) {
+          const aiPlayer = getPlayer(state, state.pendingEscalation);
+          dispatch({ type: 'WAR_ESCALATE', playerId: state.pendingEscalation });
+          setUIState((prev) => ({
+            ...prev,
+            message: `${aiPlayer?.name} ESCALATES!`,
+          }));
+        } else {
+          dispatch({ type: 'SKIP_WAR_ESCALATE' });
+        }
+      }
     } else if (uiState.phase === 'war_flipping' && state.warState && state.currentPhase === 'war_flip') {
-      // War tied, need another round
+      // War tied, need another round (double war)
       setUIState({
         phase: 'waiting_for_war_flip',
         revealedPlayers: [],
         revealedWarPlayers: [],
-        message: 'Tie! Another war round... tap to flip!',
+        message: 'DOUBLE WAR! Tap to flip again!',
+      });
+    } else if (uiState.phase === 'war_flipping' && state.warState && state.currentPhase === 'war_sacrifice') {
+      // War escalation was declared, continue to sacrifice phase
+      setUIState({
+        phase: 'war_setup',
+        revealedPlayers: [],
+        revealedWarPlayers: [],
+        message: 'War continues! Tap to flip war cards.',
       });
     }
-  }, [uiState.phase, state.lastWarResult, state.warState, state.currentPhase]);
+  }, [uiState.phase, state.lastWarResult, state.warState, state.currentPhase, state.pendingEscalation]);
+
+  // Handle war escalation decision result
+  useEffect(() => {
+    if (uiState.phase === 'war_escalation_decision' && state.lastWarResult && !state.warState) {
+      // War was finalized after skipping escalation
+      setUIState({
+        phase: 'war_result',
+        revealedPlayers: [],
+        revealedWarPlayers: [],
+        message: '',
+        warResultInfo: {
+          winnerName: state.lastWarResult.winnerName,
+          warType: state.lastWarResult.warType,
+          winningCard: state.lastWarResult.winningCard,
+          potSize: state.lastWarResult.potSize,
+          potCards: capturedPotRef.current,
+        },
+      });
+    }
+  }, [uiState.phase, state.lastWarResult, state.warState]);
 
   // Handle post-war - show result then continue
   useEffect(() => {
@@ -475,6 +538,23 @@ export function GameScreen() {
     });
   }, []);
 
+  const handleWarEscalate = useCallback(() => {
+    dispatch({ type: 'WAR_ESCALATE', playerId: 'human' });
+    setTimeout(() => {
+      setUIState({
+        phase: 'war_setup',
+        revealedPlayers: [],
+        revealedWarPlayers: [],
+        message: 'YOU ESCALATE! Sacrificing 4 more cards!',
+      });
+    }, 500);
+  }, []);
+
+  const handleSkipWarEscalate = useCallback(() => {
+    dispatch({ type: 'SKIP_WAR_ESCALATE' });
+    // After skipping, the war finalizes - wait for lastWarResult
+  }, []);
+
   const handleFlipWar = useCallback(() => {
     dispatch({ type: 'WAR_SACRIFICE' });
     setTimeout(() => {
@@ -501,11 +581,12 @@ export function GameScreen() {
   // Determine button visibility
   const canFlip = uiState.phase === 'waiting_for_flip' && !humanPlayer.isEliminated;
   const canUseReserve = uiState.phase === 'reserve_decision';
-  const canEscalate = uiState.phase === 'escalation_decision';
+  const canEscalate = uiState.phase === 'escalation_decision' || uiState.phase === 'war_escalation_decision';
   const humanInWar = state.warState?.participants.includes('human') ?? false;
   const canFlipWar = (uiState.phase === 'war_setup' || uiState.phase === 'waiting_for_war_flip') && humanInWar;
   const isGameOver = uiState.phase === 'game_over';
   const showWarResult = uiState.phase === 'war_result' && uiState.warResultInfo;
+  const isWarEscalation = uiState.phase === 'war_escalation_decision';
 
   // Filter cards to show based on reveal state
   const getDisplayPlayers = () => {
@@ -576,8 +657,8 @@ export function GameScreen() {
         canUseReserve={canUseReserve}
         canFlipWar={canFlipWar}
         onFlip={handleFlip}
-        onEscalate={handleEscalate}
-        onSkipEscalate={handleSkipEscalate}
+        onEscalate={isWarEscalation ? handleWarEscalate : handleEscalate}
+        onSkipEscalate={isWarEscalation ? handleSkipWarEscalate : handleSkipEscalate}
         onUseReserve={handleUseReserve}
         onSkipReserve={handleSkipReserve}
         onFlipWar={handleFlipWar}

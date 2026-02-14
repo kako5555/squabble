@@ -196,6 +196,103 @@ export function declareEscalation(state: GameState, playerId: string): GameState
 }
 
 /**
+ * Escalate during an existing war (after war flip shows 1 rank below)
+ */
+export function declareWarEscalation(state: GameState, playerId: string): GameState {
+  const newState = cloneState(state);
+  const war = newState.warState;
+
+  if (!war || newState.pendingEscalation !== playerId) {
+    return state; // Can't escalate
+  }
+
+  const escalatingPlayer = getPlayer(newState, playerId);
+  if (!escalatingPlayer) return state;
+
+  // Find the current winner (highest card)
+  const participants = war.participants
+    .map((pid) => {
+      const p = getPlayer(newState, pid);
+      return { player: p!, card: p?.flippedCard };
+    })
+    .filter((p) => p.card !== null);
+
+  let winnerId = participants[0]?.player.id;
+  let winnerCard = participants[0]?.card;
+
+  for (const p of participants) {
+    if (p.card && winnerCard && compareCards(p.card, winnerCard) > 0) {
+      winnerId = p.player.id;
+      winnerCard = p.card;
+    }
+  }
+
+  if (!winnerId) return state;
+
+  // Add current flipped cards to pot
+  for (const p of participants) {
+    if (p.card) {
+      war.pot.push(p.card);
+      p.player.flippedCard = null;
+    }
+  }
+
+  // Set up next war round with escalation
+  war.round += 1;
+  war.participants = [playerId, winnerId];
+  war.sacrificeCount = {
+    [playerId]: WAR_SACRIFICE_COUNTS.escalation, // 4 cards for escalator
+    [winnerId]: WAR_SACRIFICE_COUNTS.standard, // 3 cards for defender
+  };
+  war.warFlipCards = {};
+
+  newState.currentPhase = 'war_sacrifice';
+  newState.pendingEscalation = null;
+
+  newState.log.push(
+    `📈 WAR ESCALATION! ${escalatingPlayer.name} challenges with 4 cards!`
+  );
+
+  return newState;
+}
+
+/**
+ * Skip war escalation and finalize the winner
+ */
+export function skipWarEscalation(state: GameState): GameState {
+  const newState = cloneState(state);
+  const war = newState.warState;
+
+  if (!war) return state;
+
+  // Find the winner (highest card)
+  const participants = war.participants
+    .map((pid) => {
+      const p = getPlayer(newState, pid);
+      return { player: p!, card: p?.flippedCard };
+    })
+    .filter((p) => p.card !== null);
+
+  let winnerId = participants[0]?.player.id;
+  let winnerCard = participants[0]?.card;
+
+  for (const p of participants) {
+    if (p.card && winnerCard && compareCards(p.card, winnerCard) > 0) {
+      winnerId = p.player.id;
+      winnerCard = p.card;
+    }
+  }
+
+  newState.pendingEscalation = null;
+
+  if (winnerId) {
+    return finalizeWarWinner(newState, winnerId);
+  }
+
+  return newState;
+}
+
+/**
  * Swap flipped card with reserve card
  */
 export function useReserve(state: GameState, playerId: string): GameState {
@@ -469,10 +566,10 @@ export function resolveWar(state: GameState): GameState {
     }
   }
 
-  // If tie, recursive war
+  // If tie, recursive war (double war)
   if (bestPlayers.length > 1) {
     const tiedIds = bestPlayers.map((p) => p.player.id);
-    newState.log.push(`Tie in war! ${tiedIds.map((id) => getPlayer(newState, id)?.name).join(' and ')} clash again!`);
+    newState.log.push(`DOUBLE WAR! ${tiedIds.map((id) => getPlayer(newState, id)?.name).join(' and ')} clash again!`);
 
     // Reset for next war round
     war.round += 1;
@@ -491,11 +588,38 @@ export function resolveWar(state: GameState): GameState {
       }
     }
 
-    newState.currentPhase = 'war_sacrifice';
+    // Clear war flip cards for next round
+    war.warFlipCards = {};
+
+    newState.currentPhase = 'war_flip';
     return newState;
   }
 
-  // Single winner
+  // Check for war escalation eligibility (someone is 1 rank below winner)
+  // Skip for Squabbles - they have special resolution with high card check
+  if (war.type !== 'squabble') {
+    const winnerCard = bestPlayers[0].card!;
+    const winnerRank = winnerCard.rank;
+    const escalationEligible: string[] = [];
+
+    for (const p of participants) {
+      if (p.player.id !== bestPlayers[0].player.id && p.card) {
+        // Check if exactly 1 rank below (not using Kerfuffle rules for escalation check)
+        if (p.card.rank === winnerRank - 1) {
+          escalationEligible.push(p.player.id);
+        }
+      }
+    }
+
+    if (escalationEligible.length > 0) {
+      // Someone can escalate - set pending escalation
+      newState.pendingEscalation = escalationEligible.includes('human') ? 'human' : escalationEligible[0];
+      newState.currentPhase = 'war_resolve'; // Stay in war_resolve, UI will check pendingEscalation
+      return newState;
+    }
+  }
+
+  // Single winner, no escalation possible (or Squabble)
   return finalizeWarWinner(newState, bestPlayers[0].player.id);
 }
 
